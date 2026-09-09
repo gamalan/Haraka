@@ -71,6 +71,7 @@ class HMailItem extends events.EventEmitter {
         this.next_cb = dummy_func
         this.bounce_error = null
         this.hook = null
+        this.mx_errors = []
         this.size_file()
     }
 
@@ -272,6 +273,7 @@ class HMailItem extends events.EventEmitter {
     }
 
     async found_mx(mxs) {
+        this.mx_errors = []
         // support RFC 7505 null MX
         if (mxs.length === 1 && mxs[0].priority === 0 && mxs[0].exchange === '') {
             for (const rcpt of this.todo.rcpt_to) {
@@ -307,10 +309,12 @@ class HMailItem extends events.EventEmitter {
     async try_deliver() {
         // are any MXs left?
         if (this.mxlist.length === 0) {
+            const details = this.mx_errors.length ? `: ${this.mx_errors.join('; ')}` : ' (no MX endpoints attempted: empty mxlist, check resolve_mx_hosts/DNS)'
+            const reason = `Tried all MXs ${this.todo.domain}${details}`
             for (const rcpt of this.todo.rcpt_to) {
-                this.extend_rcpt_with_dsn(rcpt, DSN.addr_bad_dest_system(`Tried all MXs ${this.todo.domain}`))
+                this.extend_rcpt_with_dsn(rcpt, DSN.addr_bad_dest_system(reason))
             }
-            return this.temp_fail('Tried all MXs')
+            return this.temp_fail(reason)
         }
 
         const mx = this.mxlist.shift()
@@ -347,6 +351,7 @@ class HMailItem extends events.EventEmitter {
                 } else {
                     logger.error(this, `Failed to get socket: ${err}`)
                 }
+                this.mx_errors.push(`${mx.exchange}:${mx.port} ${err}`)
 
                 return this.try_deliver() // try next MX
             }
@@ -364,13 +369,20 @@ class HMailItem extends events.EventEmitter {
         }
 
         socket.once('timeout', function () {
-            socket.emit('error', `socket timeout waiting on ${command}`)
+            if (!processing_mail) return
+
+            self.logerror(`Remote end ${host}:${port} timed out waiting on ${command}. Trying next MX.`)
+            self.mx_errors.push(`${host}:${port} socket timeout waiting on ${command}`)
+            processing_mail = false
+            client_pool.release_client(socket, mx)
+            self.try_deliver()
         })
 
         socket.on('error', (err) => {
             if (!processing_mail) return
 
             self.logerror(`Ongoing connection failed to ${host}:${port} : ${err}`)
+            self.mx_errors.push(`${host}:${port} ${err}`)
             processing_mail = false
             client_pool.release_client(socket, mx)
             if (err.source === 'tls')
@@ -385,6 +397,7 @@ class HMailItem extends events.EventEmitter {
             if (!processing_mail) return
 
             self.logerror(`Remote end ${host}:${port} closed connection while we were processing mail. Trying next MX.`)
+            self.mx_errors.push(`${host}:${port} closed connection`)
             processing_mail = false
             client_pool.release_client(socket, mx)
             self.try_deliver()
@@ -1358,11 +1371,12 @@ class HMailItem extends events.EventEmitter {
             return this.discard() // calls next_cb
         }
 
-        let delay = params?.delay * 1000
-
-        if (retval === constants.denysoft) {
-            delay = parseInt(msg, 10) * 1000
+        let delay = Number.isFinite(params?.delay) ? params.delay * 1000 : 0
+        if (retval === constants.denysoft && msg) {
+            const parsed = parseInt(msg, 10)
+            if (!Number.isNaN(parsed)) delay = parsed * 1000
         }
+        if (!Number.isFinite(delay) || delay < 0) delay = 0
 
         this.loginfo(`Temp failing ${this.filename} for ${delay / 1000} seconds: ${params.err}`)
         const parts = _qfile.parts(this.filename)

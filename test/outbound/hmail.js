@@ -104,6 +104,25 @@ describe('outbound/hmail', () => {
         hmail.todo = { domain: 'hit.example.com' }
         assert.equal(hmail.get_force_tls({ exchange: '1.2.3.5' }), true)
     })
+
+    it('Tried all MXs includes per-MX failure details', () => {
+        hmail.todo = { domain: 'example.com', rcpt_to: [{ original: 'u@example.com' }] }
+        hmail.mxlist = []
+        hmail.mx_errors = ['mx1.example.com:25 connect ECONNREFUSED', 'mx2.example.com:25 socket timeout']
+        hmail.temp_fail = (err) => {
+            hmail.deferred_err = err
+        }
+
+        hmail.try_deliver()
+
+        assert.match(
+            hmail.deferred_err,
+            /^Tried all MXs example.com: mx1\.example\.com:25 connect ECONNREFUSED; mx2\.example\.com:25 socket timeout$/,
+        )
+        const rcpt = hmail.todo.rcpt_to[0]
+        assert.equal(rcpt.dsn_status, '5.1.2')
+        assert.match(rcpt.dsn_msg, /^Tried all MXs example.com: mx1/)
+    })
 })
 
 const TOOLONG_FIXTURE = 'test/queue/1509000000000_1509000000000_0_99999_ToLong_1_haraka'
